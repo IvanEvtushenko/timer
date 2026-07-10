@@ -44,6 +44,17 @@ LINE = "#262a34"        # тонкая линия под полем задачи
 PLACEHOLDER = "try_"
 
 
+# Источник времени для измерения интервалов. CLOCK_BOOTTIME, в отличие от
+# monotonic, продолжает идти, пока ноутбук спит, поэтому таймер «переживает»
+# закрытие крышки: после пробуждения он показывает реальное прошедшее время,
+# а длительность в логе совпадает с интервалом start→end.
+if hasattr(time, "CLOCK_BOOTTIME"):
+    def mono() -> float:
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+else:
+    mono = time.monotonic
+
+
 def hms(seconds: float) -> str:
     """Секунды -> 'HH:MM:SS'."""
     s = int(seconds)
@@ -104,6 +115,16 @@ class Stopwatch:
         self.task_entry.bind("<FocusOut>", self._task_focus_out)
         self.task_entry.bind("<Return>", self._task_done)
         self.task_entry.bind("<Escape>", self._task_done)
+
+        # Кнопка «продолжить прошлую сессию» — под строкой с подписью.
+        # Показывается только пока часы на 00:00:00; исчезает, как начат отсчёт.
+        self.continue_btn = None
+        self._last_session = self._read_last_session()
+        if self._last_session:
+            _, total, _ = self._last_session
+            self.continue_btn = self._btn(
+                wrap, f"продолжить прошлую сессию · {hms(total)}", self._continue_last)
+            self.continue_btn.pack(pady=(16, 0))
 
     def _build_clock(self, parent):
         """Часы из фиксированных ячеек: смена цифры не сдвигает соседние."""
@@ -196,15 +217,43 @@ class Stopwatch:
                 self.session_active = True
                 self.accumulated = 0.0
                 self.session_start_wall = datetime.now()
-            self.seg_start_mono = time.monotonic()
+                self._hide_continue()
+            self.seg_start_mono = mono()
             self.seg_start_wall = datetime.now()
             self.running = True
             self._set_clock_color(CLOCK_ON)
             self.start_btn.config(text="Пауза")
 
+    def _continue_last(self):
+        """Продолжить последнюю сессию из лога: тот же session_start, накопленное
+        время — на часах, отсчёт сразу идёт. Новые сегменты пишутся в ту же сессию."""
+        if self.session_active or not self._last_session:
+            return
+        sess_start, total, task = self._last_session
+        self.session_active = True
+        self.session_start_wall = datetime.strptime(sess_start, "%Y-%m-%d %H:%M:%S")
+        self.accumulated = float(total)
+        if task and task != "—":            # вернуть задачу прошлой сессии
+            self.task_entry.delete(0, "end")
+            self.task_entry.insert(0, task)
+            self.task_entry.config(fg=MUTED)
+            self._task_is_placeholder = False
+        self.seg_start_mono = mono()
+        self.seg_start_wall = datetime.now()
+        self.running = True
+        self._set_clock_color(CLOCK_ON)
+        self._set_clock_text(hms(self.accumulated))
+        self.start_btn.config(text="Пауза")
+        self._hide_continue()
+
+    def _hide_continue(self):
+        if self.continue_btn is not None:
+            self.continue_btn.destroy()
+            self.continue_btn = None
+
     def _end_segment(self):
         """Закрыть текущий рабочий интервал и записать его в лог."""
-        dur = time.monotonic() - self.seg_start_mono
+        dur = mono() - self.seg_start_mono
         self.accumulated += dur
         if dur >= 1:  # не засоряем лог случайными нажатиями < 1 c
             self._log_segment(self.seg_start_wall, datetime.now(), dur)
@@ -241,10 +290,33 @@ class Stopwatch:
         with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerows(migrated)
 
+    @staticmethod
+    def _read_last_session():
+        """Вернуть (session_start, суммарные_секунды, задача) последней сессии
+        из лога или None, если лога/данных нет."""
+        if not LOG_FILE.exists():
+            return None
+        with open(LOG_FILE, newline="", encoding="utf-8") as f:
+            rows = [r for r in csv.DictReader(f) if r.get("session_start")]
+        if not rows:
+            return None
+        last_ss = rows[-1]["session_start"]
+        total, task = 0, "—"
+        for r in rows:
+            if r["session_start"] != last_ss:
+                continue
+            try:
+                total += int(r["duration_sec"])
+            except (ValueError, KeyError):
+                pass
+            if r.get("task") and r["task"] != "—":
+                task = r["task"]
+        return last_ss, total, task
+
     # --- Обновление экрана ----------------------------------------------------
     def _tick(self):
         if self.running:
-            live = self.accumulated + (time.monotonic() - self.seg_start_mono)
+            live = self.accumulated + (mono() - self.seg_start_mono)
         else:
             live = self.accumulated
         self._set_clock_text(hms(live))

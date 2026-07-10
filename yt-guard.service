@@ -1,0 +1,6 @@
+[Unit]
+Description=YouTube guard — блокировать youtube.com, пока за день нет 7 часов на таймере
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/ivan-ev/Desktop/logs/yt_guard.py
