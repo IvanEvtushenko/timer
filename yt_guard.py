@@ -18,7 +18,7 @@ import json
 import os
 import sys
 import tempfile
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 # --- Настройки ----------------------------------------------------------------
@@ -36,6 +36,11 @@ END = "# <<< yt_guard <<<"
 # Chrome ходит через SOCKS/Xray и резолвит домены на стороне прокси).
 CHROME_POLICY_FILE = Path("/etc/opt/chrome/policies/managed/yt_guard.json")
 URL_BLOCKLIST = ["youtube.com", "youtu.be"]   # хост и все его поддомены
+
+# «Пропуск»: пока now < времени в этом файле — youtube разрешён, даже если 7ч нет.
+# Файл принадлежит пользователю (гвард его только читает), поэтому пропуск можно
+# выдавать без sudo.
+ALLOW_FILE = Path(__file__).resolve().parent / ".yt_allow"
 
 
 def today_seconds() -> int:
@@ -125,14 +130,64 @@ def apply_chrome_policy(need_block: bool) -> bool:
         return False
 
 
+def read_allow_until():
+    """Время, до которого действует пропуск (datetime), или None."""
+    try:
+        return datetime.strptime(ALLOW_FILE.read_text(encoding="utf-8").strip(),
+                                 "%Y-%m-%d %H:%M:%S")
+    except (OSError, ValueError):
+        return None
+
+
+def is_allowed() -> bool:
+    until = read_allow_until()
+    return until is not None and datetime.now() < until
+
+
+def grant_allow(minutes: float) -> None:
+    """Выдать (или отменить при minutes<=0) пропуск на N минут."""
+    if minutes <= 0:
+        if ALLOW_FILE.exists():
+            ALLOW_FILE.unlink()
+        return
+    until = datetime.now() + timedelta(minutes=minutes)
+    ALLOW_FILE.write_text(until.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
+    # оставить файл владельцу-пользователю, даже если запущено через sudo
+    uid = os.environ.get("SUDO_UID")
+    if uid and os.geteuid() == 0:
+        try:
+            os.chown(ALLOW_FILE, int(uid), int(os.environ.get("SUDO_GID", uid)))
+        except OSError:
+            pass
+
+
 def main() -> None:
+    args = sys.argv[1:]
+
+    # Разовый «пропуск»: разрешить youtube на N минут (по умолчанию 30; 0 — отменить).
+    if "--allow" in args:
+        i = args.index("--allow")
+        try:
+            mins = float(args[i + 1]) if i + 1 < len(args) else 30.0
+        except ValueError:
+            mins = 30.0
+        grant_allow(mins)
+        until = read_allow_until()
+        print(f"YouTube разрешён на {mins:g} мин — до {until:%H:%M}" if mins > 0 and until
+              else "пропуск отменён")
+        if os.geteuid() != 0:
+            print("вступит в силу в течение минуты (таймер); для мгновенного — через sudo.")
+            return
+        # запущено от root — применим прямо сейчас (проваливаемся в код ниже)
+
     if os.geteuid() != 0:
         sys.exit("Нужны права root (правятся /etc/hosts и политика Chrome). Запусти через sudo.")
 
-    unblock = "--unblock" in sys.argv
+    unblock = "--unblock" in args
     secs = today_seconds()
     h, m = secs // 3600, secs % 3600 // 60
-    need_block = (not unblock) and (secs < GOAL_SECONDS)
+    allowed = is_allowed()
+    need_block = (not unblock) and (secs < GOAL_SECONDS) and (not allowed)
 
     changed = []
     if apply_hosts(need_block):
@@ -140,10 +195,16 @@ def main() -> None:
     if apply_chrome_policy(need_block):
         changed.append("chrome-policy")
 
-    state = "БЛОК включён" if need_block else ("разблок (--unblock)" if unblock
-                                               else "разблок (цель достигнута)")
+    if need_block:
+        state = f"БЛОК · сегодня {h}:{m:02d} / 7:00"
+    elif allowed:
+        state = f"разрешено пропуском до {read_allow_until():%H:%M}"
+    elif unblock:
+        state = "разблок (--unblock)"
+    else:
+        state = f"разблок (цель достигнута: {h}:{m:02d})"
     tail = ("изменено: " + ", ".join(changed)) if changed else "без изменений"
-    print(f"{state} · сегодня {h}:{m:02d} / 7:00 · {tail}")
+    print(f"{state} · {tail}")
 
 
 if __name__ == "__main__":
